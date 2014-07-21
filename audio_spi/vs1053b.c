@@ -9,8 +9,8 @@
 #include "vs_spi.h"
 
 // use global FIFO
-#define  AUDIO_FIFO_SIZE  32
-unsigned char AUDIO_FIFO[AUDIO_FIFO_SIZE] = {0};
+#define  AUDIO_FIFO_SIZE  (1024*8)
+unsigned char* AUDIO_FIFO;
 unsigned int AUDIO_FIFO_HEAD = 0;
 unsigned int AUDIO_FIFO_TAIL = 0;
 unsigned int AUDIO_FIFO_FULL = 0;
@@ -55,7 +55,7 @@ unsigned int AUDIO_FIFO_FULL = 0;
 #define DEFAULT_TREBLEFREQ             (15000)  //1000 - 15000 Hz
 
 //VS FiFo
-#define VS_BUFSIZE                     (42*1024) //42 kBytes
+#define VS_BUFSIZE                     (32) //42 kBytes
 
 //VS Type
 
@@ -99,7 +99,9 @@ const unsigned char VS_WRITE = 0x02;
 //RAM Data
 #define VS_RAM_ENDFILLBYTE             (0x1E06)  //End fill byte
 
-#define debug_msg
+#define debug_msg			Report
+
+#define STEP							8
 
 typedef union
 {
@@ -139,7 +141,10 @@ int AUDIO_FIFO_GET(unsigned char *data, int len)
 	return i;
 }
 
-
+int AUDIO_FIFO_INIT(void)
+{
+	AUDIO_FIFO = (unsigned char *)malloc(AUDIO_FIFO_SIZE * sizeof(char));
+}
 void delay_m(int m)
 {
 	//under 80M
@@ -293,6 +298,23 @@ void audio_set_volume(int vol) //0 - 100%
   return;
 }
 
+void audio_volume(int cmd)
+{
+	if((cmd & 0x1) == 1)
+	{
+		 vs_vol += STEP;
+		audio_set_volume(vs_vol);
+		return;
+	}
+
+	if((cmd & 0x1) == 0)
+	{
+		vs_vol -= STEP;
+		audio_set_volume(vs_vol);
+		return;
+	}
+
+}
 void audio_sin_test(void)
 {
 	unsigned char sin_start[8] = {0x53, 0xef, 0x6e, 0x44, 0x00, 0x00, 0x00, 0x00};
@@ -317,7 +339,12 @@ void audio_soft_reset(void)
 	vs_spi_clk_cmd();
 	vs_write_reg(VS_MODE, 0x800 | 0x04);
 
+	// set clk
+	vs_write_reg(VS_CLOCKF, 0x9800);
+
 	// reset the decode time
+	vs_write_reg(VS_DECODETIME, 0x0000);
+	vs_write_reg(VS_DECODETIME, 0x0000);
 }
 
 int audio_reset(void)
@@ -350,19 +377,26 @@ void audio_init(void)
 
 	delay_m(50);
 
+	AUDIO_FIFO_INIT();
 	//audio_sin_test();
 
-	//vs_read_reg(VS_MODE);
-	audio_set_volume(DEFAULT_VOLUME);
-	  vs_setbassfreq(DEFAULT_BASSFREQ);
-	  vs_setbassamp(DEFAULT_BASSAMP);
-	  vs_settreblefreq(DEFAULT_TREBLEFREQ);
-	  vs_settrebleamp(DEFAULT_TREBLEAMP);
+	vs_vol=DEFAULT_VOLUME;
+	vs_sbamp=DEFAULT_BASSAMP;
+	vs_sbfreq=DEFAULT_BASSFREQ;
+	vs_stamp=DEFAULT_TREBLEAMP;
+	vs_stfreq=DEFAULT_TREBLEFREQ;
+
+		audio_set_volume(vs_vol);
+	  vs_setbassfreq(vs_sbfreq);
+	  vs_setbassamp(vs_sbamp);
+	  vs_settreblefreq(vs_stfreq);
+	  vs_settrebleamp(vs_stamp);
 }
 
 int audio_play(int len)
 {
 	unsigned char *data;
+	int i = 0;
 
 	if (len <= 0)
 		return 0;
@@ -370,8 +404,12 @@ int audio_play(int len)
 	data = (unsigned char *)malloc(len * sizeof(*data));
 	len = AUDIO_FIFO_GET(data, len);
 
-	vs_write_data(data, len);
+	for(i = 32; i <= len; i += 32)
+		vs_write_data(data + (i - 32), 32);
+	if((len + 32 - i) > 0)
+		vs_write_data(data + i - 32, len + 32 - i);
 	//audio_sin_test();
+
 	free(data);
 	//Report("play %d\r\n", len);
 	return 1;
@@ -392,7 +430,7 @@ int audio_play_l(unsigned char *data, int len)
 int audio_play_start(void)
 {
 	audio_soft_reset();
-	audio_set_volume(40);
+	audio_set_volume(vs_vol);
 	vs_spi_clk_data();
 
 	return 0;
@@ -408,19 +446,6 @@ int audio_player(unsigned char *data, int len)
 {
 	int i = 0;
 	int j = 0;
-/*
-	if(len > 32)
-	{
-		for(i = 1;len > i * 32; i++)
-			audio_play_l((data + (i - 1) * 32), 32);
-		audio_play_l((data + (i - 1) * 32), len - (i - 1) * 32);
-	}
-	else
-	{
-		// Really?!
-		return 0;
-	}
-*/
 
 	i = len;
 	while(i > 0)
@@ -431,7 +456,7 @@ int audio_player(unsigned char *data, int len)
 			audio_play(AUDIO_FIFO_SIZE);
 		}
 		j += i;
-		//Report("put %d:%d\r\n", j, AUDIO_FIFO_HEAD-AUDIO_FIFO_TAIL);
+
 		len = len - i;
 		i = len;
 	}

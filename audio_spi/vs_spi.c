@@ -101,9 +101,9 @@ int vs_req(void)
 void vs_rst(unsigned char cmd)
 {
 	if (cmd)
-		GPIOPinWrite(GPIOA2_BASE, 0x40, 1 << (22 % 8));
+		GPIOPinWrite(GPIOA0_BASE, 0x40, 1 << (6 % 8));
 	else
-		GPIOPinWrite(GPIOA2_BASE, 0x40, 0x00);
+		GPIOPinWrite(GPIOA0_BASE, 0x40, 0x00);
 }
 
 

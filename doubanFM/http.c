@@ -28,8 +28,6 @@
 
 #define HTTP_END_OF_HEADER  "\r\n\r\n"  /* string marking the end of headers in response */
 
-#define SIZE_45K 46080  /* Serial flash file size 45 KB */
-
 #define MAX_BUFF_SIZE  1460
 
 
@@ -102,48 +100,6 @@ unsigned long hexToi(unsigned char *ptr)
 
     return result;
 }
-//****************************************************************************
-//
-//! \brief Calculate the file chunk size
-//!
-//! \param[in]      len - pointer to length of the data in the buffer
-//! \param[in]      p_Buff - pointer to ponter of buffer containing data
-//! \param[out]     chunk_size - pointer to variable containing chunk size
-//!
-//! \return         0 for success, -ve for error
-//
-//****************************************************************************
-int GetChunkSize(int *len, char **p_Buff, unsigned long *chunk_size)
-{
-#if 0
-	int           idx = 0;
-	unsigned char lenBuff[10];
-
-	idx = 0;
-	memset(lenBuff, 0, 10);
-	while(*len >= 0 && **p_Buff != 13) /* check for <CR> */
-	{
-		if(*len == 0)
-		{
-			memset(g_buff, 0, sizeof(g_buff));
-			*len = sl_Recv(g_iSockID, &g_buff[0], MAX_BUFF_SIZE, 0);
-			if(*len <= 0)
-				return -1;
-
-			*p_Buff = g_buff;
-		}
-		lenBuff[idx] = **p_Buff;
-		idx++;
-		(*p_Buff)++;
-		(*len)--;
-	}
-	(*p_Buff) += 2; // skip <CR><LF>
-	(*len) -= 2;
-	*chunk_size = hexToi(lenBuff);
-	UART_PRINT("chunk size is %d\r\n", *chunk_size);
-	return 0;
-#endif
-}
 
 //****************************************************************************
 //
@@ -166,9 +122,6 @@ int play_song(char *req)
 
 	char *pBuff = 0;
 	char *end = 0;
-	char          eof_detected = 0;
-	unsigned long recv_size = 0;
-	unsigned char isChunked = 0;
 
 	unsigned int bytesReceived;
 
@@ -179,6 +132,10 @@ int play_song(char *req)
 	unsigned long ip;
 
 	int i;
+
+	int nfds;
+	SlFdSet_t readsds;
+	struct SlTimeval_t timeout;
 
 	pBuff = strstr(req, "http://");
 	if (pBuff)
@@ -211,11 +168,14 @@ int play_song(char *req)
     	Report("Cannot get host %s: %d\r\n", host, ip);
     	return -1;
     }
+
     g_iSockID = CreateConnection(ip);
 
 	if(g_iSockID < 0)
+	{
 		UART_PRINT("open socket failed\r\n");
-
+		return -1;
+	}
 	memset(g_buff, 0, sizeof(g_buff));
 
 	strcat(g_buff, "GET ");
@@ -228,10 +188,11 @@ int play_song(char *req)
 
 	// Send the HTTP GET string to the opened TCP/IP socket.
     transfer_len = sl_Send(g_iSockID, g_buff, strlen((const char *)g_buff), 0);
-
+    UART_PRINT("send req %d\r\n", transfer_len);
 	if (transfer_len < 0)
 	{
 		UART_PRINT("Socket Send Error\r\n");
+		sl_Close(g_iSockID);
 		return -1;
 	}
 
@@ -248,7 +209,7 @@ int play_song(char *req)
 		{
 			UART_PRINT("[HTTP] 404\r\n");
 
-			return -1;
+			goto end;
 		}
 
 		// if not "200 OK" return error
@@ -256,62 +217,35 @@ int play_song(char *req)
 		{
 			UART_PRINT("[HTTP] no 200\r\n");
 
-			return -1;
-		}
-
-		// check if content length is transfered with headers
-		pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_CONTENT_LENGTH);
-		if(pBuff != 0)
-		{
-			// not supported
-			//UART_PRINT("Server response format is not supported\r\n");//youmaywant read g_buff
-			//UART_PRINT(g_buff);
-			//return -1;
-		}
-
-		// Check if data is chunked
-		pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_TRANSFER_ENCODING);
-		if(pBuff != 0)
-		{
-			pBuff += strlen(HTTP_TRANSFER_ENCODING);
-			while(*pBuff == 32)
-				pBuff++;
-
-			if(memcmp(pBuff, HTTP_ENCODING_CHUNKED, strlen(HTTP_ENCODING_CHUNKED)) == 0)
-			{
-				recv_size = 0;
-				isChunked = 1;
-			}
-		}
-		else
-		{
-			// Check if connection will be closed by after sending data
-			// In this method the content length is not received and end of
-			// connection marks the end of data
-			pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_CONNECTION);
-			if(pBuff != 0)
-			{
-				pBuff += strlen(HTTP_CONNECTION);
-				while(*pBuff == 32)
-					pBuff++;
-
-				if(memcmp(pBuff, HTTP_ENCODING_CHUNKED, strlen(HTTP_CONNECTION_CLOSE)) == 0)
-				{
-					// not supported
-					UART_PRINT("Server response format is not supported\r\n");
-					return -1;
-				}
-			}
+			goto end;
 		}
 
 		// "\r\n\r\n" marks the end of headers
 
-		pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_END_OF_HEADER);
+		pBuff = strstr((const char *)g_buff, HTTP_END_OF_HEADER);
 		while(pBuff == 0)
 		{
 			memset(g_buff, 0, sizeof(g_buff));
-			transfer_len = sl_Recv(g_iSockID, &g_buff[0], MAX_BUFF_SIZE, 0);
-			pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_END_OF_HEADER);			//XXX this may cause /r/n in two buff
+
+			timeout.tv_sec = 5;
+			timeout.tv_usec = 0;
+
+			SL_FD_ZERO(&readsds);
+			SL_FD_SET(g_iSockID, &readsds);
+			nfds = g_iSockID + 1;
+
+			switch(sl_Select(nfds, &readsds, NULL, NULL, &timeout))
+			{
+			case 0:
+			case -1:
+				UART_PRINT("Select failed in getting header\r\n");
+				goto end;
+			default:
+				if (SL_FD_ISSET(g_iSockID, &readsds))
+					transfer_len = sl_Recv(g_iSockID, &g_buff[0], MAX_BUFF_SIZE, 0);
+			}
+
+			pBuff = strstr((const char *)g_buff, HTTP_END_OF_HEADER);			//XXX this may cause /r/n in two buff
 		}
 
 		// Increment by 4 to skip "\r\n\r\n"
@@ -320,149 +254,64 @@ int play_song(char *req)
 		// Adjust buffer data length for header size
 		transfer_len -= (pBuff - g_buff);
 	}
-
-	// If data in chunked format, calculate the chunk size
-	if(isChunked == 1)
-	{
-		if(GetChunkSize(&transfer_len, &pBuff, &recv_size) < 0)
-		{
-			UART_PRINT("Problen with connection to server\r\n");
-			return -1;
-		}
-	}
+	else
+		goto end;
 
 	while (0 < transfer_len)
 	{
-		// For chunked data recv_size contains the chunk size to be received
-		if(recv_size <= transfer_len && isChunked)
-		{
-			audio_player(pBuff, recv_size);
-			if(retVal < recv_size)
-			{
-				UART_PRINT("Error during writing the file\r\n");
-				return -1;
-			}
-			transfer_len -= recv_size;
-			bytesReceived +=recv_size;
-			pBuff += recv_size;
-			recv_size = 0;
-
-			if(isChunked == 1)
-			{
-				// if data in chunked format calculate next chunk size
-				pBuff += 2; // 2 bytes for <CR> <LF>
-				transfer_len -= 2;
-
-				if(GetChunkSize(&transfer_len, &pBuff, &recv_size) < 0)
-				{
-					// Error
-					break;
-				}
-
-				// if next chunk size is zero we have received the complete file
-				if(recv_size == 0)
-				{
-					eof_detected = 1;
-					break;
-				}
-
-				if(recv_size < transfer_len)
-				{
-					// Code will enter this section if the new chunk size is
-					// less than the transfer size. This will the last chunk of
-					// file received
-					audio_player(pBuff, recv_size);
-					if(retVal < recv_size)
-					{
-						UART_PRINT("Error during writing the file\r\n");
-						return -1;
-					}
-					transfer_len -= recv_size;
-					bytesReceived +=recv_size;
-					pBuff += recv_size;
-					recv_size = 0;
-
-					pBuff += 2; // 2bytes for <CR> <LF>
-					transfer_len -= 2;
-
-					// Calculate the next chunk size, should be zero
-					if(GetChunkSize(&transfer_len, &pBuff, &recv_size) < 0)
-					{
-						// Error
-						break;
-					}
-
-					// if next chunk size is non zero error
-					if(recv_size != 0)
-					{
-						// Error
-						break;
-					}
-					eof_detected = 1;
-					break;
-				}
-				else
-				{
-					audio_player(pBuff, transfer_len);
-					if(retVal < transfer_len)
-					{
-						UART_PRINT("Error during writing the file\r\n");
-						return -1;
-					}
-					recv_size -= transfer_len;
-					bytesReceived +=transfer_len;
-				}
-			}
-			// complete file received exit
-			if(recv_size == 0)
-			{
-				eof_detected = 1;
-				break;
-			}
-		}
-		else
-		{
-			audio_player(pBuff, transfer_len);
-			if (retVal < 0)
-			{
-				UART_PRINT("Error during writing the file\r\n");
-				return -1;
-			}
-			bytesReceived +=transfer_len;
-			//recv_size -= transfer_len;
-		}
+		audio_player(pBuff, transfer_len);
 
 		memset(g_buff, 0, sizeof(g_buff));
-		transfer_len = sl_Recv(g_iSockID, &g_buff[0], MAX_BUFF_SIZE, 0);
-		pBuff = g_buff;
+
+		timeout.tv_sec = 10;
+		timeout.tv_usec = 0;
+
+		SL_FD_ZERO(&readsds);
+		SL_FD_SET(g_iSockID, &readsds);
+		nfds = g_iSockID + 1;
+
+		switch(sl_Select(nfds, &readsds, NULL, NULL, &timeout))
+		{
+		case 0:
+		case -1:
+			UART_PRINT("Select failed when playing\r\n");
+			goto end;
+		default:
+			if (SL_FD_ISSET(g_iSockID, &readsds))
+			{
+				transfer_len = sl_Recv(g_iSockID, &g_buff[0], MAX_BUFF_SIZE, 0);
+				pBuff = g_buff;
+			}
+		}
+
 	}
 
+end:
 	audio_play_end();
-	if(0 > transfer_len || eof_detected == 0)
-	{
-		UART_PRINT("Error While File Download : %d\r\n", bytesReceived);
-		sl_Close(g_iSockID);
-		return -1;
-	}
-	else
-	{
-		UART_PRINT("\nDownloading File Completed with %d\r\n", bytesReceived);
-	}
 
 	sl_Close(g_iSockID);
 	return 0;
 }
 
-int get_mp3(char *buff, char *song)
+int get_mp3(char *buff, char *song, int index)
 {
     char *ptr;
     char *end;
     int i,j,k;
     char b[256] = {0};
 
-    ptr = strstr(buff, "url\":");
+    ptr = buff;
 
-    end = strstr(buff, "mp3");
+    while(index >= 0)
+    {
+    	index--;
+    	ptr += 6;
+    	ptr = strstr(ptr, "url\":");
+    	if (!ptr)
+    		break;
+    }
+
+    end = strstr(ptr, "mp3");
 
     if(ptr == 0 || end == 0)
         return -1;
@@ -483,7 +332,7 @@ int get_mp3(char *buff, char *song)
     return 0;
 }
 
-int request_song(char *req, char *song)
+int request_song(char *req, char *song, int index)
 {
 	int           transfer_len = 0;
 	long          retVal = 0;
@@ -527,14 +376,16 @@ int request_song(char *req, char *song)
 	retVal = sl_NetAppDnsGetHostByName(host, strlen(host), &ip, SL_AF_INET);
     if(retVal < 0)
     {
-    	Report("Cannot get host %s: %d\r\n", host, ip);
+    	Report("Cannot get host %s: %x\r\n", host, ip);
     	return -1;
     }
 
 	g_iSockID = CreateConnection(ip);
 	if(g_iSockID < 0)
+	{
 		UART_PRINT("open socket failed\r\n");
-
+		return -1;
+	}
 	memset(g_buff, 0, sizeof(g_buff));
 
 	strcat(g_buff, "GET ");
@@ -587,41 +438,6 @@ int request_song(char *req, char *song)
 			//return -1;
 		}
 
-		// Check if data is chunked
-		pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_TRANSFER_ENCODING);
-		if(pBuff != 0)
-		{
-			pBuff += strlen(HTTP_TRANSFER_ENCODING);
-			while(*pBuff == 32)
-				pBuff++;
-
-			if(memcmp(pBuff, HTTP_ENCODING_CHUNKED, strlen(HTTP_ENCODING_CHUNKED)) == 0)
-			{
-				recv_size = 0;
-				isChunked = 1;
-			}
-		}
-		else
-		{
-			// Check if connection will be closed by after sending data
-			// In this method the content length is not received and end of
-			// connection marks the end of data
-			pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_CONNECTION);
-			if(pBuff != 0)
-			{
-				pBuff += strlen(HTTP_CONNECTION);
-				while(*pBuff == 32)
-					pBuff++;
-
-				if(memcmp(pBuff, HTTP_ENCODING_CHUNKED, strlen(HTTP_CONNECTION_CLOSE)) == 0)
-				{
-					// not supported
-					UART_PRINT("Server response format is not supported\r\n");
-					return -1;
-				}
-			}
-		}
-
 		// "\r\n\r\n" marks the end of headers
 
 		pBuff = (unsigned char *)strstr((const char *)g_buff, HTTP_END_OF_HEADER);
@@ -648,7 +464,7 @@ int request_song(char *req, char *song)
 		{
 			//Report("request song : %s\r\n", pBuff);
 
-			get_mp3(g_buff, song);
+			get_mp3(g_buff, song, index);
 
 			if(strlen(song))
 				break;
